@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fullscreen Fluid Dynamics with G/B Dye Keys</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #111; color: #ddd; font-family: Arial, sans-serif;
+    user-select: none;
+  }
+  #canvas {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
+    cursor: crosshair;
+    image-rendering: auto;
+    z-index: 0;
+  }
+  #controls {
+    position: fixed;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    padding: 10px 20px;
+    border-radius: 8px;
+    display: flex;
+    gap: 15px;
+    align-items: center;
+    flex-wrap: wrap;
+    z-index: 10;
+    max-width: 95vw;
+  }
+  label {
+    font-size: 14px; user-select: none;
+    white-space: nowrap;
+    color: #ddd;
+  }
+  input[type=range] {
+    vertical-align: middle; width: 100px;
+  }
+  button {
+    cursor: pointer; padding: 5px 10px; font-size: 14px; background: #333; border: none; color: #ddd;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="canvas"></canvas>
+
+<div id="controls">
+  <label>Viscosity: <input type="range" id="viscosity" min="0" max="0.005" step="0.0001" value="0.0005" /></label>
+  <label>Diffusion: <input type="range" id="diffusion" min="0" max="0.005" step="0.0001" value="0.0001" /></label>
+  <label>Force Strength: <input type="range" id="force" min="10" max="5000" step="10" value="1500" /></label>
+  <label>Dye Amount: <input type="range" id="dyeAmount" min="10" max="300" step="10" value="150" /></label>
+  <button id="clearBtn">Clear</button>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const N = 128;
+  let width, height;
+  let scaleX, scaleY;
+  const dt = 0.016;
+
+  let u = new Float32Array((N+2)*(N+2));
+  let v = new Float32Array((N+2)*(N+2));
+  let u_prev = new Float32Array((N+2)*(N+2));
+  let v_prev = new Float32Array((N+2)*(N+2));
+
+  let dyeR = new Float32Array((N+2)*(N+2));
+  let dyeG = new Float32Array((N+2)*(N+2));
+  let dyeB = new Float32Array((N+2)*(N+2));
+  let dyeR_prev = new Float32Array((N+2)*(N+2));
+  let dyeG_prev = new Float32Array((N+2)*(N+2));
+  let dyeB_prev = new Float32Array((N+2)*(N+2));
+
+  function IX(x,y) { return x + (N+2)*y; }
+
+  let viscosity = 0.0005;
+  let diffusion = 0.0001;
+  let forceStrength = 1500;
+  let dyeAmount = 150;
+  const dyeDecay = 0.95;
+
+  let mouseDown = false;
+  let prevX = 0, prevY = 0;
+  let keysDown = {};
+  window.addEventListener('keydown', e => { keysDown[e.key.toLowerCase()] = true; });
+  window.addEventListener('keyup', e => { keysDown[e.key.toLowerCase()] = false; });
+
+  const offCanvas = document.createElement('canvas');
+  const offCtx = offCanvas.getContext('2d');
+  offCanvas.width = N;
+  offCanvas.height = N;
+
+  function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+    scaleX = width / N;
+    scaleY = height / N;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  function set_bnd(b, x) {
+    for(let i=1; i<=N; i++) {
+      x[IX(0,i)] = b===1 ? -x[IX(1,i)] : x[IX(1,i)];
+      x[IX(N+1,i)] = b===1 ? -x[IX(N,i)] : x[IX(N,i)];
+      x[IX(i,0)] = b===2 ? -x[IX(i,1)] : x[IX(i,1)];
+      x[IX(i,N+1)] = b===2 ? -x[IX(i,N)] : x[IX(i,N)];
+    }
+    x[IX(0,0)] = 0.5 * (x[IX(1,0)] + x[IX(0,1)]);
+    x[IX(0,N+1)] = 0.5 * (x[IX(1,N+1)] + x[IX(0,N)]);
+    x[IX(N+1,0)] = 0.5 * (x[IX(N,0)] + x[IX(N+1,1)]);
+    x[IX(N+1,N+1)] = 0.5 * (x[IX(N,N+1)] + x[IX(N+1,N)]);
+  }
+
+  function lin_solve(b,x,x0,a,c) {
+    for(let k=0;k<20;k++) {
+      for(let i=1;i<=N;i++) {
+        for(let j=1;j<=N;j++) {
+          x[IX(i,j)] = (x0[IX(i,j)] + a*(x[IX(i-1,j)] + x[IX(i+1,j)] + x[IX(i,j-1)] + x[IX(i,j+1)]))/c;
+        }
+      }
+      set_bnd(b,x);
+    }
+  }
+
+  function diffuse(b,x,x0,diff) {
+    let a = dt * diff * N * N;
+    lin_solve(b,x,x0,a,1+4*a);
+  }
+
+  function advect(b,d,d0,u,v) {
+    let dt0 = dt * N;
+    for(let i=1;i<=N;i++) {
+      for(let j=1;j<=N;j++) {
+        let x = i - dt0*u[IX(i,j)];
+        let y = j - dt0*v[IX(i,j)];
+        if(x<0.5) x=0.5;
+        if(x>N+0.5) x=N+0.5;
+        let i0 = Math.floor(x);
+        let i1 = i0+1;
+        if(y<0.5) y=0.5;
+        if(y>N+0.5) y=N+0.5;
+        let j0 = Math.floor(y);
+        let j1 = j0+1;
+        let s1 = x - i0;
+        let s0 = 1 - s1;
+        let t1 = y - j0;
+        let t0 = 1 - t1;
+        d[IX(i,j)] =
+          s0*(t0*d0[IX(i0,j0)] + t1*d0[IX(i0,j1)]) +
+          s1*(t0*d0[IX(i1,j0)] + t1*d0[IX(i1,j1)]);
+      }
+    }
+    set_bnd(b,d);
+  }
+
+  function project(u,v,p,div) {
+    for(let i=1;i<=N;i++) {
+      for(let j=1;j<=N;j++) {
+        div[IX(i,j)] = -0.5*(u[IX(i+1,j)]-u[IX(i-1,j)] + v[IX(i,j+1)]-v[IX(i,j-1)])/N;
+        p[IX(i,j)] = 0;
+      }
+    }
+    set_bnd(0,div);
+    set_bnd(0,p);
+    lin_solve(0,p,div,1,4);
+    for(let i=1;i<=N;i++) {
+      for(let j=1;j<=N;j++) {
+        u[IX(i,j)] -= 0.5*N*(p[IX(i+1,j)] - p[IX(i-1,j)]);
+        v[IX(i,j)] -= 0.5*N*(p[IX(i,j+1)] - p[IX(i,j-1)]);
+      }
+    }
+    set_bnd(1,u);
+    set_bnd(2,v);
+  }
+
+  function velocity_step(u,v,u0,v0,visc) {
+    diffuse(1,u0,u,visc);
+    diffuse(2,v0,v,visc);
+    project(u0,v0,u,v);
+    advect(1,u,u0,u0,v0);
+    advect(2,v,v0,u0,v0);
+    project(u,v,u0,v0);
+  }
+
+  function density_step(x,x0,u,v,diff) {
+    diffuse(0,x0,x,diff);
+    advect(0,x,x0,u,v);
+  }
+
+  function clearFields() {
+    for(let i=0;i<u.length;i++) {
+      u[i]=v[i]=u_prev[i]=v_prev[i]=0;
+      dyeR[i]=dyeG[i]=dyeB[i]=dyeR_prev[i]=dyeG_prev[i]=dyeB_prev[i]=0;
+    }
+  }
+  clearFields();
+
+  function renderDyes() {
+    let imgData = offCtx.createImageData(N, N);
+    let data = imgData.data;
+    for(let j=1;j<=N;j++) {
+      for(let i=1;i<=N;i++) {
+        const idx = IX(i,j);
+        let r = dyeR[idx];
+        let g = dyeG[idx];
+        let b = dyeB[idx];
+        const index = ((j-1)*N+(i-1))*4;
+        data[index]   = Math.min(255, r*255);
+        data[index+1] = Math.min(255, g*255);
+        data[index+2] = Math.min(255, b*255);
+        data[index+3] = 255;
+      }
+    }
+    offCtx.putImageData(imgData, 0, 0);
+    ctx.clearRect(0, 0, width, height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offCanvas, 0, 0, width, height);
+  }
+
+  function addDensity(x,y,amountR,amountG,amountB) {
+    let i = Math.floor(x/scaleX)+1;
+    let j = Math.floor(y/scaleY)+1;
+    if(i<1||i>N||j<1||j>N) return;
+    dyeR[IX(i,j)] += amountR;
+    dyeG[IX(i,j)] += amountG;
+    dyeB[IX(i,j)] += amountB;
+  }
+  function addVelocity(x,y,amountX,amountY) {
+    let i = Math.floor(x/scaleX)+1;
+    let j = Math.floor(y/scaleY)+1;
+    if(i<1||i>N||j<1||j>N) return;
+    u[IX(i,j)] += amountX;
+    v[IX(i,j)] += amountY;
+  }
+
+  canvas.addEventListener('mousedown', e => {
+    mouseDown = true;
+    prevX = e.offsetX;
+    prevY = e.offsetY;
+    let r=0, g=0, b=0;
+    if(keysDown['g']) g = dyeAmount;
+    else if(keysDown['b']) b = dyeAmount;
+    else r = dyeAmount;
+    addDensity(e.offsetX, e.offsetY, r, g, b);
+    addVelocity(e.offsetX, e.offsetY, 0, 0);
+  });
+
+  window.addEventListener('mouseup', () => { mouseDown = false; });
+
+  canvas.addEventListener('mousemove', e => {
+    if(!mouseDown) return;
+    const x = e.offsetX;
+    const y = e.offsetY;
+    const dx = x - prevX;
+    const dy = y - prevY;
+    let r=0,g=0,b=0;
+    if(keysDown['g']) g = dyeAmount;
+    else if(keysDown['b']) b = dyeAmount;
+    else r = dyeAmount;
+    addDensity(x,y,r,g,b);
+    addVelocity(x,y,dx*forceStrength*0.001,dy*forceStrength*0.001);
+    prevX = x; prevY = y;
+  });
+
+  const viscositySlider = document.getElementById('viscosity');
+  const diffusionSlider = document.getElementById('diffusion');
+  const forceSlider = document.getElementById('force');
+  const dyeSlider = document.getElementById('dyeAmount');
+  const clearBtn = document.getElementById('clearBtn');
+
+  viscositySlider.addEventListener('input', ()=>{ viscosity = parseFloat(viscositySlider.value); });
+  diffusionSlider.addEventListener('input', ()=>{ diffusion = parseFloat(diffusionSlider.value); });
+  forceSlider.addEventListener('input', ()=>{ forceStrength = parseFloat(forceSlider.value); });
+  dyeSlider.addEventListener('input', ()=>{ dyeAmount = parseFloat(dyeSlider.value); });
+  clearBtn.addEventListener('click', ()=>{ clearFields(); });
+
+  function update() {
+    velocity_step(u,v,u_prev,v_prev,viscosity);
+    density_step(dyeR,dyeR_prev,u,v,diffusion);
+    density_step(dyeG,dyeG_prev,u,v,diffusion);
+    density_step(dyeB,dyeB_prev,u,v,diffusion);
+
+    for(let i=0; i<dyeR.length; i++) {
+      dyeR[i] *= dyeDecay;
+      dyeG[i] *= dyeDecay;
+      dyeB[i] *= dyeDecay;
+    }
+
+    renderDyes();
+    requestAnimationFrame(update);
+  }
+  update();
+})();
+</script>
+
+</body>
+</html>
